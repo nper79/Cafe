@@ -1,0 +1,7 @@
+{
+  "name": "Nano Banana Image Studio",
+  "description": "A high-performance image generation and editing suite powered by Gemini 2.5 and 3.0 models. Create stunning visuals or edit existing ones with natural language prompts.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
