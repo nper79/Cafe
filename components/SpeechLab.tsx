@@ -10,11 +10,18 @@ const SpeechLab: React.FC = () => {
   const [textToSpeak, setTextToSpeak] = useState('');
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isGeneratingAudio, setIsGeneratingAudio] = useState(false);
+  
+  // Frame Indices
   const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
   
-  // New State for Action Selection
+  // Action Selection State
   const [idleActionId, setIdleActionId] = useState<string>('');
   const [talkingActionId, setTalkingActionId] = useState<string>('');
+  const [blinkActionId, setBlinkActionId] = useState<string>(''); // New Blink State
+
+  // Blinking Logic State
+  const [isBlinking, setIsBlinking] = useState(false);
+  const nextBlinkTimeRef = useRef<number>(Date.now() + 5000); // Initial blink delay
 
   // Background Removal State
   const [bgTolerance, setBgTolerance] = useState(30);
@@ -27,8 +34,11 @@ const SpeechLab: React.FC = () => {
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
   
+  // Audio & Animation Refs
   const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null); // New Analyser Ref
   const animationRef = useRef<number | null>(null);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bgInputRef = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -44,7 +54,6 @@ const SpeechLab: React.FC = () => {
         
         let character: Character;
 
-        // Detect Format: New Action Pack vs Legacy
         if (json.actions && Array.isArray(json.actions)) {
            character = {
              id: json.id || Date.now().toString(),
@@ -67,9 +76,16 @@ const SpeechLab: React.FC = () => {
         if (character.actions.length === 0) throw new Error("Sem ações no ficheiro.");
 
         setActiveCharacter(character);
+        
+        // Intelligent Defaults
         setIdleActionId(character.actions[0].name);
         setTalkingActionId(character.actions.length > 1 ? character.actions[1].name : character.actions[0].name);
-        // Reset position on new load
+        
+        // Try to find a blink action automatically
+        const blinkAction = character.actions.find(a => a.name.toLowerCase().includes('blink') || a.name.toLowerCase().includes('piscar'));
+        if (blinkAction) setBlinkActionId(blinkAction.name);
+        else setBlinkActionId(''); // User sets manually if not found
+
         setCharPosition({ x: 0, y: 0 }); 
 
       } catch (err: any) {
@@ -135,16 +151,12 @@ const SpeechLab: React.FC = () => {
         y: e.clientY - dragStartRef.current.y
       });
     };
-
-    const handleMouseUp = () => {
-      setIsDragging(false);
-    };
+    const handleMouseUp = () => setIsDragging(false);
 
     if (isDragging) {
       window.addEventListener('mousemove', handleMouseMove);
       window.addEventListener('mouseup', handleMouseUp);
     }
-
     return () => {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
@@ -159,21 +171,102 @@ const SpeechLab: React.FC = () => {
     return action ? action.frames : [];
   };
 
-  // Animation Loop
+  // --- MAIN ANIMATION LOOP ---
   useEffect(() => {
     let lastUpdate = 0;
-    const fps = isSpeaking ? 12 : 4; 
-    const interval = 1000 / fps;
-
+    
     const animate = (time: number) => {
-      if (time - lastUpdate > interval && activeCharacter) {
-        const currentActionId = isSpeaking ? talkingActionId : idleActionId;
-        const frames = getActiveFrames(currentActionId);
-        if (frames.length > 0) {
-            setCurrentFrameIndex(prev => (prev + 1) % frames.length);
-        }
-        lastUpdate = time;
+      if (!activeCharacter) {
+        animationRef.current = requestAnimationFrame(animate);
+        return;
       }
+
+      // --- 1. HANDLE RANDOM BLINKING ---
+      if (!isSpeaking && blinkActionId) { // Only blink if not talking
+        const now = Date.now();
+        if (!isBlinking && now > nextBlinkTimeRef.current) {
+          setIsBlinking(true);
+          setCurrentFrameIndex(0); // Start blink from frame 0
+        }
+      }
+
+      // --- 2. DETERMINE CURRENT STATE & FRAMES ---
+      let targetFrames: string[] = [];
+      let fps = 10; 
+      
+      if (isSpeaking) {
+        targetFrames = getActiveFrames(talkingActionId);
+        // Talking logic handles FPS differently (audio reactive)
+      } else if (isBlinking && blinkActionId) {
+        targetFrames = getActiveFrames(blinkActionId);
+        fps = 15; // Blinking is fast
+      } else {
+        targetFrames = getActiveFrames(idleActionId);
+        fps = 4; // Idle is slow breathing
+      }
+
+      // --- 3. AUDIO REACTIVE LIP SYNC (If Speaking) ---
+      if (isSpeaking && analyserRef.current && targetFrames.length > 0) {
+         // Get volume data
+         const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+         analyserRef.current.getByteFrequencyData(dataArray);
+         
+         // Calculate average volume (Amplitude)
+         let sum = 0;
+         // Analyze lower frequencies (vowels) mostly
+         const binCount = Math.floor(dataArray.length / 4); 
+         for (let i = 0; i < binCount; i++) {
+            sum += dataArray[i];
+         }
+         const average = sum / binCount;
+         
+         // Thresholds for sprite mapping
+         // Assuming sprites are ordered: Closed -> Slightly Open -> Wide Open
+         const threshold = 10; // Noise floor
+         
+         if (average < threshold) {
+            setCurrentFrameIndex(0); // Mouth Closed
+         } else {
+            // Map volume (10 - 150) to Frame Index (1 to max)
+            // We skip frame 0 (closed) when there is sound
+            const maxVolume = 120; // Adjust sensitivity
+            const intensity = Math.min(1, (average - threshold) / maxVolume);
+            
+            // Map intensity to frames [1 ... length-1]
+            const totalMouthFrames = targetFrames.length - 1; 
+            const frameOffset = Math.ceil(intensity * totalMouthFrames);
+            
+            // Clamp
+            const idx = Math.min(targetFrames.length - 1, Math.max(1, frameOffset));
+            setCurrentFrameIndex(idx);
+         }
+
+      } 
+      // --- 4. STANDARD TIME-BASED ANIMATION (Idle / Blink) ---
+      else {
+        const interval = 1000 / fps;
+        if (time - lastUpdate > interval) {
+          if (targetFrames.length > 0) {
+            // Logic for Blink: Play once then stop
+            if (isBlinking) {
+               if (currentFrameIndex >= targetFrames.length - 1) {
+                 // Blink finished
+                 setIsBlinking(false);
+                 // Randomize next blink: 10s to 15s
+                 nextBlinkTimeRef.current = Date.now() + 10000 + Math.random() * 5000;
+                 setCurrentFrameIndex(0); // Reset for Idle
+               } else {
+                 setCurrentFrameIndex(prev => prev + 1);
+               }
+            } else {
+               // Normal Loop (Idle)
+               setCurrentFrameIndex(prev => (prev + 1) % targetFrames.length);
+            }
+          }
+          lastUpdate = time;
+        }
+      }
+
       animationRef.current = requestAnimationFrame(animate);
     };
 
@@ -181,7 +274,7 @@ const SpeechLab: React.FC = () => {
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
-  }, [isSpeaking, activeCharacter, idleActionId, talkingActionId]);
+  }, [isSpeaking, isBlinking, activeCharacter, idleActionId, talkingActionId, blinkActionId]);
 
   const handleSpeak = async () => {
     if (!textToSpeak.trim() || !activeCharacter) return;
@@ -206,11 +299,27 @@ const SpeechLab: React.FC = () => {
           audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
         }
         const ctx = audioContextRef.current;
+        
+        // Setup Analyser
+        if (!analyserRef.current) {
+          analyserRef.current = ctx.createAnalyser();
+          analyserRef.current.fftSize = 256; // Smaller FFT size for faster reaction
+          analyserRef.current.smoothingTimeConstant = 0.5; // Smooth out jitter
+        }
+
         const audioBuffer = await decodeAudioData(decodeBase64(base64Audio), ctx);
         const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
-        source.connect(ctx.destination);
-        source.onended = () => setIsSpeaking(false);
+        
+        // Connect: Source -> Analyser -> Speaker
+        source.connect(analyserRef.current);
+        analyserRef.current.connect(ctx.destination);
+        
+        source.onended = () => {
+          setIsSpeaking(false);
+          setCurrentFrameIndex(0); // Close mouth when done
+        };
+        
         setIsSpeaking(true);
         source.start();
       }
@@ -223,8 +332,14 @@ const SpeechLab: React.FC = () => {
     }
   };
 
-  const currentFrames = isSpeaking ? getActiveFrames(talkingActionId) : getActiveFrames(idleActionId);
-  const currentImage = currentFrames[currentFrameIndex % currentFrames.length];
+  // Determine which frame array to use for rendering
+  let currentFrames: string[] = [];
+  if (isSpeaking) currentFrames = getActiveFrames(talkingActionId);
+  else if (isBlinking && blinkActionId) currentFrames = getActiveFrames(blinkActionId);
+  else currentFrames = getActiveFrames(idleActionId);
+
+  // Safe access
+  const currentImage = currentFrames[currentFrameIndex % currentFrames.length] || currentFrames[0];
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 animate-in fade-in duration-500">
@@ -255,9 +370,9 @@ const SpeechLab: React.FC = () => {
                     </div>
                     
                     <div className="space-y-2 pt-2 border-t border-orange-500/20">
-                        <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-2">
                            <div>
-                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Repouso</label>
+                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Repouso (Idle)</label>
                               <select 
                                   value={idleActionId} 
                                   onChange={(e) => setIdleActionId(e.target.value)}
@@ -267,12 +382,23 @@ const SpeechLab: React.FC = () => {
                               </select>
                            </div>
                            <div>
-                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Fala</label>
+                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Fala (Audio-Reactive)</label>
                               <select 
                                   value={talkingActionId} 
                                   onChange={(e) => setTalkingActionId(e.target.value)}
                                   className="w-full bg-slate-900 border border-slate-700 rounded-lg text-[10px] text-white p-2"
                               >
+                                  {activeCharacter.actions.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
+                              </select>
+                           </div>
+                           <div>
+                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Piscar (Aleatório 10-15s)</label>
+                              <select 
+                                  value={blinkActionId} 
+                                  onChange={(e) => setBlinkActionId(e.target.value)}
+                                  className="w-full bg-slate-900 border border-slate-700 rounded-lg text-[10px] text-white p-2"
+                              >
+                                  <option value="">(Desativado)</option>
                                   {activeCharacter.actions.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
                               </select>
                            </div>
@@ -399,7 +525,7 @@ const SpeechLab: React.FC = () => {
                  
                  <div className="absolute top-4 left-4 flex gap-2">
                     <div className="px-2 py-1 bg-black/60 rounded text-[9px] text-white font-bold backdrop-blur border border-white/10">
-                        {isSpeaking ? `FALA: ${talkingActionId}` : `REPOUSO: ${idleActionId}`}
+                        {isSpeaking ? `FALA: ${talkingActionId}` : isBlinking ? `PISCAR: ${blinkActionId}` : `REPOUSO: ${idleActionId}`}
                     </div>
                     {isDragging && <div className="px-2 py-1 bg-yellow-400 text-black rounded text-[9px] font-bold">MOVENDO</div>}
                  </div>
