@@ -18,12 +18,24 @@ export interface CharacterAction {
   frames: string[];
 }
 
+export interface SceneConfig {
+  charPosition: { x: number; y: number };
+  charScale: number;
+  bgPosition: { x: number; y: number };
+  bgScale: number;
+  // New persistence fields
+  backgroundImage?: string | null;
+  bgMusicData?: string | null; // Base64 audio
+  bgMusicName?: string | null;
+}
+
 export interface Character {
   id: string;
   name: string;
   actions: CharacterAction[]; // Flexible list of actions (e.g., "Angry", "Happy", "Blinking")
   defaultIdleAction?: string;
   defaultTalkingAction?: string;
+  sceneConfig?: SceneConfig;
 }
 
 export interface VideoState {

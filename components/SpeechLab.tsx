@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, Modality } from "@google/genai";
-import { Character, CharacterAction } from '../types';
+import { Character, CharacterAction, SceneConfig } from '../types';
 import { decodeBase64, decodeAudioData } from '../utils/audioUtils';
 import { removeColorBackground } from '../utils/imageUtils';
 
@@ -17,11 +17,11 @@ const SpeechLab: React.FC = () => {
   // Action Selection State
   const [idleActionId, setIdleActionId] = useState<string>('');
   const [talkingActionId, setTalkingActionId] = useState<string>('');
-  const [blinkActionId, setBlinkActionId] = useState<string>(''); // New Blink State
+  const [blinkActionId, setBlinkActionId] = useState<string>(''); 
 
   // Blinking Logic State
   const [isBlinking, setIsBlinking] = useState(false);
-  const nextBlinkTimeRef = useRef<number>(Date.now() + 5000); // Initial blink delay
+  const nextBlinkTimeRef = useRef<number>(Date.now() + 5000); 
 
   // Background Removal State
   const [bgTolerance, setBgTolerance] = useState(30);
@@ -29,18 +29,32 @@ const SpeechLab: React.FC = () => {
 
   // Scene Composition State
   const [backgroundImage, setBackgroundImage] = useState<string | null>(null);
+  
+  // Transform States
+  const [editMode, setEditMode] = useState<'character' | 'background'>('character'); 
   const [charPosition, setCharPosition] = useState({ x: 0, y: 0 });
   const [charScale, setCharScale] = useState(1);
+  const [bgPosition, setBgPosition] = useState({ x: 0, y: 0 });
+  const [bgScale, setBgScale] = useState(1);
+
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
+
+  // Background Music State (MP3)
+  const [bgMusicUrl, setBgMusicUrl] = useState<string | null>(null);
+  const [bgMusicName, setBgMusicName] = useState<string>('');
   
   // Audio & Animation Refs
   const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null); // New Analyser Ref
+  const analyserRef = useRef<AnalyserNode | null>(null); 
   const animationRef = useRef<number | null>(null);
+  
+  // Lip Sync Smoothing Ref
+  const currentVolumeRef = useRef<number>(0);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bgInputRef = useRef<HTMLInputElement>(null);
+  const musicInputRef = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -58,7 +72,8 @@ const SpeechLab: React.FC = () => {
            character = {
              id: json.id || Date.now().toString(),
              name: json.name || "Action Pack",
-             actions: json.actions
+             actions: json.actions,
+             sceneConfig: json.sceneConfig // Load scene config if exists
            };
         } else if (json.idle && json.talking) {
            character = {
@@ -77,16 +92,47 @@ const SpeechLab: React.FC = () => {
 
         setActiveCharacter(character);
         
-        // Intelligent Defaults
+        // Restore Positions & Scene Config if available
+        if (character.sceneConfig) {
+            setCharPosition(character.sceneConfig.charPosition || {x:0, y:0});
+            setCharScale(character.sceneConfig.charScale || 1);
+            setBgPosition(character.sceneConfig.bgPosition || {x:0, y:0});
+            setBgScale(character.sceneConfig.bgScale || 1);
+            
+            // Restore Background Image
+            if (character.sceneConfig.backgroundImage) {
+                setBackgroundImage(character.sceneConfig.backgroundImage);
+            } else {
+                setBackgroundImage(null);
+            }
+
+            // Restore Music
+            if (character.sceneConfig.bgMusicData) {
+                setBgMusicUrl(character.sceneConfig.bgMusicData);
+                setBgMusicName(character.sceneConfig.bgMusicName || "Music Loaded from JSON");
+            } else {
+                setBgMusicUrl(null);
+                setBgMusicName('');
+            }
+        } else {
+            // Reset to defaults if new character has no config
+            setCharPosition({ x: 0, y: 0 });
+            setCharScale(1);
+            setBgPosition({ x: 0, y: 0 });
+            setBgScale(1);
+            setBackgroundImage(null);
+            setBgMusicUrl(null);
+            setBgMusicName('');
+        }
+
         setIdleActionId(character.actions[0].name);
         setTalkingActionId(character.actions.length > 1 ? character.actions[1].name : character.actions[0].name);
         
-        // Try to find a blink action automatically
         const blinkAction = character.actions.find(a => a.name.toLowerCase().includes('blink') || a.name.toLowerCase().includes('piscar'));
         if (blinkAction) setBlinkActionId(blinkAction.name);
-        else setBlinkActionId(''); // User sets manually if not found
-
-        setCharPosition({ x: 0, y: 0 }); 
+        else setBlinkActionId(''); 
+        
+        nextBlinkTimeRef.current = Date.now() + 5000;
 
       } catch (err: any) {
         alert("Erro ao carregar asset: " + err.message);
@@ -101,8 +147,18 @@ const SpeechLab: React.FC = () => {
       const reader = new FileReader();
       reader.onload = (event) => {
         setBackgroundImage(event.target?.result as string);
+        setEditMode('background'); 
       };
       reader.readAsDataURL(file);
+    }
+  };
+
+  const handleMusicUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = URL.createObjectURL(file);
+      setBgMusicUrl(url);
+      setBgMusicName(file.name);
     }
   };
 
@@ -132,24 +188,90 @@ const SpeechLab: React.FC = () => {
       setIsProcessingBg(false);
     }
   };
+  
+  const handleExportJson = async () => {
+    if (!activeCharacter) return;
+    
+    // Convert Music Blob URL to Base64 if it exists and is not already data URI
+    let musicData = null;
+    if (bgMusicUrl) {
+        if (bgMusicUrl.startsWith('data:')) {
+            musicData = bgMusicUrl;
+        } else {
+            try {
+                const response = await fetch(bgMusicUrl);
+                const blob = await response.blob();
+                musicData = await new Promise<string>((resolve) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result as string);
+                    reader.readAsDataURL(blob);
+                });
+            } catch (e) {
+                console.warn("Could not save audio data to JSON", e);
+            }
+        }
+    }
 
-  // Drag Logic
+    // Capture CURRENT scene state
+    const currentSceneConfig: SceneConfig = {
+        charPosition,
+        charScale,
+        bgPosition,
+        bgScale,
+        backgroundImage: backgroundImage, // Save the actual background image data
+        bgMusicData: musicData,
+        bgMusicName: bgMusicName
+    };
+
+    const characterWithConfig: Character = {
+        ...activeCharacter,
+        sceneConfig: currentSceneConfig
+    };
+    
+    const jsonString = JSON.stringify(characterWithConfig, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${activeCharacter.name.replace(/\s+/g, '_')}_Saved.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  useEffect(() => {
+    if (blinkActionId) {
+        nextBlinkTimeRef.current = Date.now() + 10000 + (Math.random() * 10000);
+        setIsBlinking(false);
+    }
+  }, [blinkActionId]);
+
   const handleMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
     setIsDragging(true);
+    
+    const currentPos = editMode === 'character' ? charPosition : bgPosition;
+    
     dragStartRef.current = {
-      x: e.clientX - charPosition.x,
-      y: e.clientY - charPosition.y
+      x: e.clientX - currentPos.x,
+      y: e.clientY - currentPos.y
     };
   };
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!isDragging) return;
-      setCharPosition({
-        x: e.clientX - dragStartRef.current.x,
-        y: e.clientY - dragStartRef.current.y
-      });
+      
+      const newX = e.clientX - dragStartRef.current.x;
+      const newY = e.clientY - dragStartRef.current.y;
+
+      if (editMode === 'character') {
+        setCharPosition({ x: newX, y: newY });
+      } else {
+        setBgPosition({ x: newX, y: newY });
+      }
     };
     const handleMouseUp = () => setIsDragging(false);
 
@@ -161,17 +283,14 @@ const SpeechLab: React.FC = () => {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [isDragging]);
+  }, [isDragging, editMode]); 
 
-
-  // Helper to get frames
   const getActiveFrames = (actionId: string) => {
     if (!activeCharacter) return [];
     const action = activeCharacter.actions.find(a => a.name === actionId);
     return action ? action.frames : [];
   };
 
-  // --- MAIN ANIMATION LOOP ---
   useEffect(() => {
     let lastUpdate = 0;
     
@@ -182,84 +301,86 @@ const SpeechLab: React.FC = () => {
       }
 
       // --- 1. HANDLE RANDOM BLINKING ---
-      if (!isSpeaking && blinkActionId) { // Only blink if not talking
+      if (!isSpeaking && blinkActionId) {
         const now = Date.now();
         if (!isBlinking && now > nextBlinkTimeRef.current) {
           setIsBlinking(true);
-          setCurrentFrameIndex(0); // Start blink from frame 0
+          setCurrentFrameIndex(0); 
         }
       }
 
-      // --- 2. DETERMINE CURRENT STATE & FRAMES ---
+      // If we started speaking during a blink, cancel the blink immediately
+      if (isSpeaking && isBlinking) {
+        setIsBlinking(false);
+        // Do not reset index here, let the speaking logic take over
+      }
+
       let targetFrames: string[] = [];
       let fps = 10; 
       
       if (isSpeaking) {
         targetFrames = getActiveFrames(talkingActionId);
-        // Talking logic handles FPS differently (audio reactive)
       } else if (isBlinking && blinkActionId) {
         targetFrames = getActiveFrames(blinkActionId);
-        fps = 15; // Blinking is fast
+        fps = 12; // Slightly faster blink
       } else {
         targetFrames = getActiveFrames(idleActionId);
-        fps = 4; // Idle is slow breathing
+        fps = 4; // Slow idle breathing
       }
 
-      // --- 3. AUDIO REACTIVE LIP SYNC (If Speaking) ---
+      // --- LIP SYNC LOGIC ---
       if (isSpeaking && analyserRef.current && targetFrames.length > 0) {
-         // Get volume data
          const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
          analyserRef.current.getByteFrequencyData(dataArray);
          
-         // Calculate average volume (Amplitude)
          let sum = 0;
-         // Analyze lower frequencies (vowels) mostly
-         const binCount = Math.floor(dataArray.length / 4); 
-         for (let i = 0; i < binCount; i++) {
+         const startBin = 1; 
+         const endBin = 32;
+         const count = endBin - startBin;
+         
+         for (let i = startBin; i < endBin; i++) {
             sum += dataArray[i];
          }
-         const average = sum / binCount;
+         const rawAverage = sum / count;
          
-         // Thresholds for sprite mapping
-         // Assuming sprites are ordered: Closed -> Slightly Open -> Wide Open
-         const threshold = 10; // Noise floor
-         
-         if (average < threshold) {
-            setCurrentFrameIndex(0); // Mouth Closed
+         // Smooth Attack/Decay
+         if (rawAverage > currentVolumeRef.current) {
+             currentVolumeRef.current += (rawAverage - currentVolumeRef.current) * 0.6; 
          } else {
-            // Map volume (10 - 150) to Frame Index (1 to max)
-            // We skip frame 0 (closed) when there is sound
-            const maxVolume = 120; // Adjust sensitivity
-            const intensity = Math.min(1, (average - threshold) / maxVolume);
-            
-            // Map intensity to frames [1 ... length-1]
+             currentVolumeRef.current += (rawAverage - currentVolumeRef.current) * 0.2; 
+         }
+         
+         const smoothedVolume = currentVolumeRef.current;
+         const threshold = 10; 
+         
+         if (smoothedVolume < threshold) {
+            setCurrentFrameIndex(0); 
+         } else {
+            const maxVolume = 120; 
+            const intensity = Math.min(1, (smoothedVolume - threshold) / maxVolume);
             const totalMouthFrames = targetFrames.length - 1; 
             const frameOffset = Math.ceil(intensity * totalMouthFrames);
-            
-            // Clamp
             const idx = Math.min(targetFrames.length - 1, Math.max(1, frameOffset));
             setCurrentFrameIndex(idx);
          }
 
       } 
-      // --- 4. STANDARD TIME-BASED ANIMATION (Idle / Blink) ---
+      // --- STANDARD ANIMATION ---
       else {
         const interval = 1000 / fps;
         if (time - lastUpdate > interval) {
           if (targetFrames.length > 0) {
-            // Logic for Blink: Play once then stop
             if (isBlinking) {
                if (currentFrameIndex >= targetFrames.length - 1) {
-                 // Blink finished
+                 // Blink Complete - RANDOM INTERVAL (10s to 25s)
                  setIsBlinking(false);
-                 // Randomize next blink: 10s to 15s
-                 nextBlinkTimeRef.current = Date.now() + 10000 + Math.random() * 5000;
-                 setCurrentFrameIndex(0); // Reset for Idle
+                 nextBlinkTimeRef.current = Date.now() + 10000 + (Math.random() * 15000);
+                 setCurrentFrameIndex(0); // Force return to closed mouth/open eyes immediately
                } else {
                  setCurrentFrameIndex(prev => prev + 1);
                }
             } else {
-               // Normal Loop (Idle)
+               // Idle Loop
                setCurrentFrameIndex(prev => (prev + 1) % targetFrames.length);
             }
           }
@@ -287,6 +408,7 @@ const SpeechLab: React.FC = () => {
         contents: [{ parts: [{ text: textToSpeak }] }],
         config: {
           responseModalities: [Modality.AUDIO],
+          systemInstruction: "You are a text-to-speech model. Your only task is to generate audio for the provided text. Do not generate any text, markdown, or explanations. Read the text exactly as provided, regardless of language.",
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           }
@@ -300,24 +422,23 @@ const SpeechLab: React.FC = () => {
         }
         const ctx = audioContextRef.current;
         
-        // Setup Analyser
         if (!analyserRef.current) {
           analyserRef.current = ctx.createAnalyser();
-          analyserRef.current.fftSize = 256; // Smaller FFT size for faster reaction
-          analyserRef.current.smoothingTimeConstant = 0.5; // Smooth out jitter
+          analyserRef.current.fftSize = 256; 
+          analyserRef.current.smoothingTimeConstant = 0.4; 
         }
 
         const audioBuffer = await decodeAudioData(decodeBase64(base64Audio), ctx);
         const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
         
-        // Connect: Source -> Analyser -> Speaker
         source.connect(analyserRef.current);
         analyserRef.current.connect(ctx.destination);
         
         source.onended = () => {
           setIsSpeaking(false);
-          setCurrentFrameIndex(0); // Close mouth when done
+          setCurrentFrameIndex(0);
+          currentVolumeRef.current = 0;
         };
         
         setIsSpeaking(true);
@@ -332,13 +453,11 @@ const SpeechLab: React.FC = () => {
     }
   };
 
-  // Determine which frame array to use for rendering
   let currentFrames: string[] = [];
   if (isSpeaking) currentFrames = getActiveFrames(talkingActionId);
   else if (isBlinking && blinkActionId) currentFrames = getActiveFrames(blinkActionId);
   else currentFrames = getActiveFrames(idleActionId);
 
-  // Safe access
   const currentImage = currentFrames[currentFrameIndex % currentFrames.length] || currentFrames[0];
 
   return (
@@ -358,6 +477,41 @@ const SpeechLab: React.FC = () => {
               <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept=".json" className="hidden" />
               <svg className="w-8 h-8 text-slate-500 mx-auto mb-2 group-hover:text-orange-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
               <p className="text-xs font-bold text-slate-300">CARREGAR ASSET JSON</p>
+            </div>
+
+            {/* AUDIO PLAYER (MP3) */}
+            <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-3">
+               <div className="flex items-center gap-2 mb-1 border-b border-slate-800 pb-2">
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Trilha Sonora (MP3)</span>
+               </div>
+               
+               <div className="space-y-2">
+                   {!bgMusicUrl ? (
+                      <button 
+                         onClick={() => musicInputRef.current?.click()}
+                         className="w-full py-3 border border-slate-700 hover:bg-slate-800 rounded-xl text-[10px] font-bold text-slate-400 uppercase flex items-center justify-center gap-2 group transition-all"
+                      >
+                         <input type="file" ref={musicInputRef} onChange={handleMusicUpload} accept="audio/*" className="hidden" />
+                         <div className="w-6 h-6 bg-slate-900 rounded-full flex items-center justify-center group-hover:bg-red-500 group-hover:text-white transition-colors">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 10l12-3" /></svg>
+                         </div>
+                         Carregar Música
+                      </button>
+                   ) : (
+                      <div className="bg-slate-900 rounded-xl p-3 border border-slate-800 space-y-2">
+                         <div className="flex items-center justify-between">
+                            <span className="text-[10px] text-white font-bold truncate w-32" title={bgMusicName}>{bgMusicName}</span>
+                            <button 
+                               onClick={() => { setBgMusicUrl(null); setBgMusicName(''); }}
+                               className="text-[9px] text-red-400 hover:text-red-300 uppercase font-bold"
+                            >
+                               Remover
+                            </button>
+                         </div>
+                         <audio src={bgMusicUrl} controls loop className="w-full h-8 block rounded-lg bg-slate-800" />
+                      </div>
+                   )}
+               </div>
             </div>
 
             {activeCharacter && (
@@ -392,7 +546,7 @@ const SpeechLab: React.FC = () => {
                               </select>
                            </div>
                            <div>
-                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Piscar (Aleatório 10-15s)</label>
+                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Piscar (Aleatório 10-25s)</label>
                               <select 
                                   value={blinkActionId} 
                                   onChange={(e) => setBlinkActionId(e.target.value)}
@@ -409,7 +563,22 @@ const SpeechLab: React.FC = () => {
                   {/* Scene Control */}
                   <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-4">
                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Cenário / Background</span>
+                        <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Composição de Cena</span>
+                     </div>
+
+                     <div className="flex gap-2 p-1 bg-slate-900 rounded-xl border border-slate-800">
+                        <button 
+                          onClick={() => setEditMode('character')}
+                          className={`flex-1 py-2 text-[9px] font-bold uppercase rounded-lg transition-all ${editMode === 'character' ? 'bg-orange-500 text-white shadow' : 'text-slate-500 hover:text-slate-300'}`}
+                        >
+                          Mover Personagem
+                        </button>
+                        <button 
+                          onClick={() => setEditMode('background')}
+                          className={`flex-1 py-2 text-[9px] font-bold uppercase rounded-lg transition-all ${editMode === 'background' ? 'bg-blue-600 text-white shadow' : 'text-slate-500 hover:text-slate-300'}`}
+                        >
+                          Mover Fundo
+                        </button>
                      </div>
 
                      {!backgroundImage ? (
@@ -419,11 +588,11 @@ const SpeechLab: React.FC = () => {
                        >
                          <input type="file" ref={bgInputRef} onChange={handleBgUpload} accept="image/*" className="hidden" />
                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-                         Carregar Imagem de Fundo
+                         Carregar Fundo
                        </button>
                      ) : (
                        <div className="relative rounded-lg overflow-hidden border border-slate-700 group">
-                          <img src={backgroundImage} className="w-full h-16 object-cover opacity-50" alt="bg" />
+                          <img src={backgroundImage} className="w-full h-12 object-cover opacity-50" alt="bg" />
                           <button 
                              onClick={() => setBackgroundImage(null)}
                              className="absolute inset-0 flex items-center justify-center bg-black/50 text-[10px] text-white font-bold opacity-0 group-hover:opacity-100 transition-opacity"
@@ -433,29 +602,51 @@ const SpeechLab: React.FC = () => {
                        </div>
                      )}
                      
-                     <div className="space-y-2 pt-2 border-t border-slate-800">
-                        <div className="flex justify-between">
-                           <label className="text-[9px] text-slate-500 font-bold">Escala do Personagem</label>
-                           <span className="text-[9px] text-orange-400 font-mono">{charScale.toFixed(1)}x</span>
-                        </div>
-                        <input 
-                           type="range" min="0.1" max="2" step="0.1"
-                           value={charScale}
-                           onChange={(e) => setCharScale(parseFloat(e.target.value))}
-                           className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-orange-500"
-                        />
-                        <button onClick={() => { setCharPosition({x:0, y:0}); setCharScale(1); }} className="text-[9px] text-slate-600 hover:text-orange-400 w-full text-right underline">
-                           Reset Posição
-                        </button>
-                     </div>
+                     {editMode === 'character' ? (
+                       <div className="space-y-2 pt-2 border-t border-slate-800 animate-in fade-in">
+                          <div className="flex justify-between">
+                             <label className="text-[9px] text-slate-500 font-bold">Escala do Personagem</label>
+                             <span className="text-[9px] text-orange-400 font-mono">{charScale.toFixed(1)}x</span>
+                          </div>
+                          <input 
+                             type="range" min="0.1" max="4" step="0.1"
+                             value={charScale}
+                             onChange={(e) => setCharScale(parseFloat(e.target.value))}
+                             className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                          />
+                          <button onClick={() => { setCharPosition({x:0, y:0}); setCharScale(1); }} className="text-[9px] text-slate-600 hover:text-orange-400 w-full text-right underline">
+                             Reset Posição (Personagem)
+                          </button>
+                       </div>
+                     ) : (
+                        <div className="space-y-2 pt-2 border-t border-slate-800 animate-in fade-in">
+                          <div className="flex justify-between">
+                             <label className="text-[9px] text-slate-500 font-bold">Escala do Fundo</label>
+                             <span className="text-[9px] text-blue-400 font-mono">{bgScale.toFixed(1)}x</span>
+                          </div>
+                          <input 
+                             type="range" min="0.1" max="5" step="0.1"
+                             value={bgScale}
+                             onChange={(e) => setBgScale(parseFloat(e.target.value))}
+                             className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                          />
+                          <button onClick={() => { setBgPosition({x:0, y:0}); setBgScale(1); }} className="text-[9px] text-slate-600 hover:text-blue-400 w-full text-right underline">
+                             Reset Posição (Fundo)
+                          </button>
+                       </div>
+                     )}
                   </div>
 
-                  {/* Tools */}
+                  {/* Tools / Cleaning */}
                   <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-3">
+                     <div className="flex items-center gap-2 mb-1 border-b border-slate-800 pb-2">
+                        <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Limpeza & Exportação</span>
+                     </div>
+
                      <div className="space-y-2">
                         <div className="flex justify-between items-end">
-                           <label className="text-[9px] text-slate-500 font-bold">Tolerância (BG Removal)</label>
-                           <span className="text-[9px] text-orange-400 font-mono">{bgTolerance}</span>
+                           <label className="text-[9px] text-slate-500 font-bold">Remover Halo (Tolerância)</label>
+                           <span className="text-[9px] text-orange-400 font-mono">{bgTolerance}%</span>
                         </div>
                         <input 
                           type="range" min="1" max="100" 
@@ -465,20 +656,30 @@ const SpeechLab: React.FC = () => {
                         />
                      </div>
 
-                     <button 
-                       onClick={handleRemoveBackground}
-                       disabled={isProcessingBg}
-                       className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-black uppercase rounded-lg border border-slate-700 hover:border-orange-500/50 transition-all flex items-center justify-center gap-2"
-                     >
-                       {isProcessingBg ? (
-                         <>
-                            <div className="w-3 h-3 border-2 border-slate-500 border-t-white rounded-full animate-spin"></div>
-                            Processando...
-                         </>
-                       ) : (
-                         "Remover Fundo Branco"
-                       )}
-                     </button>
+                     <div className="grid grid-cols-1 gap-2">
+                         <button 
+                           onClick={handleRemoveBackground}
+                           disabled={isProcessingBg}
+                           className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-black uppercase rounded-lg border border-slate-700 hover:border-orange-500/50 transition-all flex items-center justify-center gap-2"
+                         >
+                           {isProcessingBg ? (
+                             <>
+                                <div className="w-3 h-3 border-2 border-slate-500 border-t-white rounded-full animate-spin"></div>
+                                Processando...
+                             </>
+                           ) : (
+                             "Limpar Halo / Fundo"
+                           )}
+                         </button>
+                         
+                         <button 
+                           onClick={handleExportJson}
+                           className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-black uppercase rounded-lg shadow-lg hover:shadow-emerald-500/20 transition-all flex items-center justify-center gap-2"
+                         >
+                           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                           Salvar Asset Atualizado
+                         </button>
+                     </div>
                   </div>
               </div>
             )}
@@ -494,40 +695,56 @@ const SpeechLab: React.FC = () => {
               {/* STAGE AREA */}
               <div 
                  ref={stageRef}
-                 className="relative w-full aspect-video rounded-3xl overflow-hidden border-4 border-slate-800 shadow-2xl bg-black transition-all"
-                 style={{ 
-                    backgroundImage: backgroundImage ? `url(${backgroundImage})` : `url('https://www.transparenttextures.com/patterns/carbon-fibre.png')`,
-                    backgroundSize: 'cover',
-                    backgroundPosition: 'center'
-                 }}
+                 onMouseDown={handleMouseDown}
+                 className={`relative w-full aspect-video rounded-3xl overflow-hidden border-4 border-slate-800 shadow-2xl bg-black transition-all ${isDragging ? 'cursor-move' : ''}`}
               >
+                 {/* Background Layer */}
+                 {backgroundImage ? (
+                   <img 
+                      src={backgroundImage}
+                      className="absolute left-1/2 top-1/2 max-w-none origin-center pointer-events-none select-none"
+                      style={{
+                         transform: `translate(calc(-50% + ${bgPosition.x}px), calc(-50% + ${bgPosition.y}px)) scale(${bgScale})`,
+                         minWidth: '100%',
+                         minHeight: '100%'
+                      }}
+                      alt="Background"
+                   />
+                 ) : (
+                    <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')] opacity-20 pointer-events-none"></div>
+                 )}
+
+                 {/* Character Layer */}
                  {currentImage && (
                     <div
-                       onMouseDown={handleMouseDown}
-                       className={`absolute cursor-move select-none transition-transform duration-75 ${isDragging ? 'opacity-80' : 'opacity-100'}`}
+                       className={`absolute select-none transition-transform duration-75 pointer-events-none ${isDragging && editMode === 'character' ? 'opacity-80' : 'opacity-100'}`}
                        style={{
                           left: '50%',
                           top: '50%',
                           transform: `translate(calc(-50% + ${charPosition.x}px), calc(-50% + ${charPosition.y}px)) scale(${charScale})`,
-                          touchAction: 'none'
                        }}
                     >
                        <img 
                           src={currentImage} 
-                          className={`max-h-[300px] object-contain pointer-events-none ${isSpeaking && !backgroundImage ? 'drop-shadow-[0_0_15px_rgba(250,204,21,0.5)]' : 'drop-shadow-2xl'}`}
+                          className={`max-h-[300px] object-contain ${isSpeaking && !backgroundImage ? 'drop-shadow-[0_0_15px_rgba(250,204,21,0.5)]' : 'drop-shadow-2xl'}`}
                           alt="Character"
                        />
-                       
-                       {/* Drag Outline Hint */}
-                       <div className="absolute inset-0 border-2 border-yellow-400/0 hover:border-yellow-400/50 rounded-lg transition-colors pointer-events-none"></div>
                     </div>
+                 )}
+
+                 {/* Drag Hints */}
+                 {isDragging && (
+                   <div className="absolute inset-0 border-2 border-yellow-400/50 rounded-lg pointer-events-none flex items-center justify-center">
+                      <div className="bg-black/50 px-4 py-2 rounded-full text-white font-bold backdrop-blur">
+                         MOVENDO {editMode === 'character' ? 'PERSONAGEM' : 'FUNDO'}
+                      </div>
+                   </div>
                  )}
                  
                  <div className="absolute top-4 left-4 flex gap-2">
                     <div className="px-2 py-1 bg-black/60 rounded text-[9px] text-white font-bold backdrop-blur border border-white/10">
                         {isSpeaking ? `FALA: ${talkingActionId}` : isBlinking ? `PISCAR: ${blinkActionId}` : `REPOUSO: ${idleActionId}`}
                     </div>
-                    {isDragging && <div className="px-2 py-1 bg-yellow-400 text-black rounded text-[9px] font-bold">MOVENDO</div>}
                  </div>
               </div>
 
