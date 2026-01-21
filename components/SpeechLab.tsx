@@ -21,7 +21,7 @@ const SpeechLab: React.FC = () => {
 
   // Blinking Logic State
   const [isBlinking, setIsBlinking] = useState(false);
-  const nextBlinkTimeRef = useRef<number>(Date.now() + 5000); 
+  const nextBlinkTimeRef = useRef<number>(Date.now() + 3000); 
 
   // Background Removal State
   const [bgTolerance, setBgTolerance] = useState(30);
@@ -132,7 +132,9 @@ const SpeechLab: React.FC = () => {
         if (blinkAction) setBlinkActionId(blinkAction.name);
         else setBlinkActionId(''); 
         
-        nextBlinkTimeRef.current = Date.now() + 5000;
+        // Reset blinking timer
+        nextBlinkTimeRef.current = Date.now() + 3000;
+        setIsBlinking(false);
 
       } catch (err: any) {
         alert("Erro ao carregar asset: " + err.message);
@@ -243,7 +245,8 @@ const SpeechLab: React.FC = () => {
 
   useEffect(() => {
     if (blinkActionId) {
-        nextBlinkTimeRef.current = Date.now() + 10000 + (Math.random() * 10000);
+        // Reset blinking when action changes
+        nextBlinkTimeRef.current = Date.now() + 3000 + (Math.random() * 5000);
         setIsBlinking(false);
     }
   }, [blinkActionId]);
@@ -291,6 +294,7 @@ const SpeechLab: React.FC = () => {
     return action ? action.frames : [];
   };
 
+  // --- MAIN ANIMATION LOOP ---
   useEffect(() => {
     let lastUpdate = 0;
     
@@ -300,19 +304,24 @@ const SpeechLab: React.FC = () => {
         return;
       }
 
-      // --- 1. HANDLE RANDOM BLINKING ---
-      if (!isSpeaking && blinkActionId) {
+      // 1. TRIGGER BLINK (If not speaking and time has passed)
+      if (!isSpeaking && !isBlinking && blinkActionId) {
         const now = Date.now();
-        if (!isBlinking && now > nextBlinkTimeRef.current) {
+        if (now > nextBlinkTimeRef.current) {
           setIsBlinking(true);
-          setCurrentFrameIndex(0); 
+          setCurrentFrameIndex(0); // Start blink from beginning
+          // Set next time far in future to prevent re-trigger during animation
+          nextBlinkTimeRef.current = now + 999999; 
+          
+          // Restart loop with new state
+          animationRef.current = requestAnimationFrame(animate);
+          return; 
         }
       }
 
       // If we started speaking during a blink, cancel the blink immediately
       if (isSpeaking && isBlinking) {
         setIsBlinking(false);
-        // Do not reset index here, let the speaking logic take over
       }
 
       let targetFrames: string[] = [];
@@ -328,7 +337,7 @@ const SpeechLab: React.FC = () => {
         fps = 4; // Slow idle breathing
       }
 
-      // --- LIP SYNC LOGIC ---
+      // 2. LIP SYNC LOGIC
       if (isSpeaking && analyserRef.current && targetFrames.length > 0) {
          const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
          analyserRef.current.getByteFrequencyData(dataArray);
@@ -365,22 +374,27 @@ const SpeechLab: React.FC = () => {
          }
 
       } 
-      // --- STANDARD ANIMATION ---
+      // 3. FRAME PROGRESSION LOGIC
       else {
         const interval = 1000 / fps;
         if (time - lastUpdate > interval) {
           if (targetFrames.length > 0) {
+            
             if (isBlinking) {
-               if (currentFrameIndex >= targetFrames.length - 1) {
-                 // Blink Complete - RANDOM INTERVAL (10s to 25s)
+               // --- BLINK MODE: PLAY ONCE ---
+               const isLastFrame = currentFrameIndex >= targetFrames.length - 1;
+               if (isLastFrame) {
+                 // Blink Finished. Stop.
                  setIsBlinking(false);
-                 nextBlinkTimeRef.current = Date.now() + 10000 + (Math.random() * 15000);
-                 setCurrentFrameIndex(0); // Force return to closed mouth/open eyes immediately
+                 setCurrentFrameIndex(0); // Reset for Idle
+                 // Schedule next blink randomly (2s to 6s)
+                 nextBlinkTimeRef.current = Date.now() + 2000 + (Math.random() * 4000);
                } else {
+                 // Next Blink Frame
                  setCurrentFrameIndex(prev => prev + 1);
                }
             } else {
-               // Idle Loop
+               // --- IDLE MODE: LOOP ---
                setCurrentFrameIndex(prev => (prev + 1) % targetFrames.length);
             }
           }
@@ -408,7 +422,7 @@ const SpeechLab: React.FC = () => {
         contents: [{ parts: [{ text: textToSpeak }] }],
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: "You are a text-to-speech model. Your only task is to generate audio for the provided text. Do not generate any text, markdown, or explanations. Read the text exactly as provided, regardless of language.",
+          // systemInstruction removed to avoid 500 errors
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           }
@@ -446,7 +460,14 @@ const SpeechLab: React.FC = () => {
       }
     } catch (err: any) {
       console.error("TTS Error:", err);
-      alert("Falha ao gerar voz: " + (err?.message || "Unknown error"));
+      // More user-friendly error handling
+      let msg = err?.message || "Unknown error";
+      if (msg.includes("500") || msg.includes("INTERNAL")) {
+         msg = "Service temporary unavailable (500). Please try again later or try shorter text.";
+      } else if (msg.includes("400") || msg.includes("INVALID_ARGUMENT")) {
+         msg = "The model refused to generate audio. This usually happens with foreign languages or complex text. Try simplifying your prompt.";
+      }
+      alert("TTS Falhou: " + msg);
       setIsSpeaking(false);
     } finally {
       setIsGeneratingAudio(false);
@@ -546,7 +567,7 @@ const SpeechLab: React.FC = () => {
                               </select>
                            </div>
                            <div>
-                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Piscar (Aleatório 10-25s)</label>
+                              <label className="text-[9px] text-slate-400 font-bold uppercase block mb-1">Piscar (Aleatório 2-6s)</label>
                               <select 
                                   value={blinkActionId} 
                                   onChange={(e) => setBlinkActionId(e.target.value)}
